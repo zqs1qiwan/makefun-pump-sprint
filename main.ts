@@ -4,16 +4,18 @@
 // How it works:
 //  - Every coin is watched from its CreateEvent. In its first few slots the bot
 //    reads the opening tape: how big the creator's own buy was, how many other
-//    wallets piled in (a launch bundled by many wallets is usually the creator's
-//    cluster waiting to dump), whether the creator has already sold, and how
-//    much real SOL the curve holds. Only launches that pass the filter get
-//    bought, with a small 0.10 SOL stake.
-//  - Exits are fast: take profit at +15%, cut at -12%, never hold past ~30
-//    slots, leave at once when the creator sells. A partial take-profit sells
-//    half at +8% and lets the rest ride under a tight trailing stop.
-//  - Guardrail pacing: the run needs round trips on at least 20 coins. When the
-//    bot's own fills or distinct coins lag the pace, it opens tiny 0.02 SOL
-//    probe round trips on liquid curves and sells them as soon as the buy lands.
+//    wallets piled in, whether the creator has already sold, and how much real
+//    SOL the curve holds. Only strong launches get bought: real reserves of at
+//    least 10 SOL in the first 3 slots, 2-3 distinct non-creator buyers, creator
+//    buy at most 1 SOL, creator not sold. First buy up to 0.50 SOL (capped at
+//    1% of real reserves), then up to 2 add-on tranches of 0.50 SOL while the
+//    price holds at or above the last buy and net flow stays non-negative —
+//    size goes to the runners, false starts stay small.
+//  - Exits are fast: take profit at +40%, cut at -8%, never hold past 15
+//    slots, leave at once when the creator sells.
+//  - Guardrail pacing: the run needs round trips on at least 20 coins, but the
+//    filter only finds ~12, so tiny 0.01 SOL probe round trips top the count up
+//    to 20 and are sold as soon as the buy lands.
 //  - Deterministic by construction: no clock, no randomness, no environment;
 //    every iteration is over insertion-ordered maps fed by the batch stream.
 
@@ -28,28 +30,33 @@ const MAX_SLIPPAGE_SELL_BPS = 10_000;
 const P = {
   minAgeSlots: 0, // youngest age (slots since create) at which a coin may be bought
   maxAgeSlots: 3, // oldest age at which a first buy may still be decided
-  stakeSol: 0.1, // SOL to aim for per coin in total
+  stakeSol: 0.5, // SOL to aim for per coin in the first buy
+  addSol: 0.5, // SOL per add-on tranche (at most maxAdds of them)
+  maxAdds: 2, // add-on buys after the first, while the price holds up
+  addDelaySlots: 2, // slots to wait after the previous buy before an add
+  addStepUp: 0.0, // an add needs the price at least this far above the last buy
+  addMinFlowSol: 0, // an add needs net flow over the last 10 slots at least this
   minBuySol: 0.01, // smallest single buy worth paying the tx fee for
-  minRqSol: 0.3, // real SOL reserve window at decision time
+  minRqSol: 10, // real SOL reserve window at decision time
   maxRqSol: 30,
-  maxDevBuySol: 2.5, // creator's own buys in the create slot, at most
-  minBuyers: 3, // distinct non-creator buyers before entry, at least
+  maxDevBuySol: 1.0, // creator's own buys in the create slot, at most
+  minBuyers: 2, // distinct non-creator buyers before entry, at least
   maxBuyers: 3, // distinct non-creator buyers before entry, at most
-  maxRunup: 2.0, // price now over the create price, at most
+  maxRunup: 100.0, // price now over the create price, at most
   tp1Up: 10.0, // first take-profit: sell tp1Part of the position at this gain
   tp1Part: 0.5,
-  tpUp: 0.25, // exit when the position is worth this much over its cost
+  tpUp: 0.4, // exit when the position is worth this much over its cost
   slDown: 0.08, // exit when it is worth this much under its cost
   slAfterTp1Down: 0.02, // after the first take-profit, stop out at this loss
   trailArmUp: 10.0, // trailing stop arms once value is up this much
   trailDown: 0.05, // exit on a fall of this much from the best value
   maxHoldSlots: 15, // exit after holding this many slots
-  targetCoins: 25, // guardrail pacing targets
-  targetFills: 200,
+  targetCoins: 20, // guardrail pacing targets
+  targetFills: 40,
   paceSecs: 21_600, // 6h final window; pace saturates at 1 after that
-  probeSol: 0.02,
+  probeSol: 0.01,
   maxProbes: 1,
-  maxExposureSol: 2.5,
+  maxExposureSol: 10.0,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,6 +81,8 @@ interface Held {
   tookTp1: boolean;
   exiting: boolean;
   filled: boolean;
+  txPaid: bigint; // tx fees paid on this position's fills
+  devSoldAtOpen: boolean; // creator had already sold when the first buy filled
 }
 
 /** Opening-tape state for one young coin. */
@@ -89,6 +98,12 @@ interface Coin {
   soldByOthers: bigint; // SOL sold by non-creator wallets
   lastTradeSlot: number;
   done: boolean; // never buy it again
+  buysSent: number; // buys sent (first buy + adds)
+  spentSent: bigint; // lamports sent in buys so far
+  lastBuyVq: bigint; // decision price (vq/vt pair) of the last buy sent
+  lastBuyVt: bigint;
+  lastBuySlot: number;
+  recent: Array<{ slot: number; signed: bigint }>; // signed SOL per trade, last 10 slots
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +115,16 @@ const lamportsToSol = (lam: bigint): number => Number(lam) / 1e9;
 /** Price of one token in SOL, from virtual reserves. */
 const priceOf = (vq: bigint, vt: bigint): number =>
   vt === 0n ? 0 : Number(vq) / Number(vt);
+
+/** Net SOL (buys minus sells) over the last 10 slots, pruning older trades. */
+function flowNet(c: Coin, now: number): bigint {
+  let drop = 0;
+  while (drop < c.recent.length && c.recent[drop]!.slot <= now - 10) drop++;
+  if (drop > 0) c.recent.splice(0, drop);
+  let net = 0n;
+  for (const t of c.recent) net += t.signed;
+  return net;
+}
 
 /** Estimated SOL received for selling `tokens` into the curve, curve + tx fees out. */
 function sellValueLamports(tokens: bigint, vq: bigint, vt: bigint, txFee: bigint): bigint {
@@ -150,6 +175,12 @@ function coinOf(mint: Mint, slot: number): Coin {
       soldByOthers: 0n,
       lastTradeSlot: slot,
       done: false,
+      buysSent: 0,
+      spentSent: 0n,
+      lastBuyVq: 0n,
+      lastBuyVt: 1n,
+      lastBuySlot: 0,
+      recent: [],
     };
     coins.set(mint, c);
   }
@@ -220,6 +251,19 @@ function decideOrders(batch: any): any[] {
     if (f.status === 'filled') {
       myFills++;
       myCoins.add(f.mint);
+      const h = held.get(f.mint);
+      if (h !== undefined) {
+        try {
+          h.txPaid += BigInt((f as any).tx_fee_lamports ?? 0);
+        } catch {
+          // no tx fee on this fill record
+        }
+        if (f.side === 'buy' && !h.filled) {
+          h.openedSlot = typeof f.slot === 'number' ? f.slot : now;
+          h.filled = true;
+          h.devSoldAtOpen = coins.get(f.mint)?.devSold ?? false;
+        }
+      }
     }
   }
 
@@ -269,6 +313,7 @@ function decideOrders(batch: any): any[] {
       const c = coinOf(e.mint, e.slot);
       const sol = BigInt(e.sol_amount);
       c.lastTradeSlot = e.slot;
+      c.recent.push({ slot: e.slot, signed: e.is_buy ? sol : -sol });
       const isDev = e.user === c.creator;
       if (e.is_buy) {
         if (isDev && e.slot === c.createdSlot) c.devBuy += sol;
@@ -338,11 +383,11 @@ function decideOrders(batch: any): any[] {
     if (curve === undefined || curve.complete) continue;
     let h = held.get(mint);
     if (h === undefined) {
-      h = { openedSlot: now, peakValue: 0n, tookTp1: false, exiting: false, filled: true };
+      h = { openedSlot: now, peakValue: 0n, tookTp1: false, exiting: false, filled: true, txPaid: 0n, devSoldAtOpen: coins.get(mint)?.devSold ?? false };
       held.set(mint, h);
     }
     const value = sellValueLamports(pos.tokens, curve.vq, curve.vt, tx);
-    const cost = pos.cost;
+    const cost = pos.cost + h.txPaid;
     if (value > h.peakValue) h.peakValue = value;
     const c = coins.get(mint);
 
@@ -367,7 +412,7 @@ function decideOrders(batch: any): any[] {
       exit = true;
     }
     if (now - h.openedSlot >= P.maxHoldSlots) exit = true;
-    if (c !== undefined && c.devSold) exit = true;
+    if (c !== undefined && c.devSold && !h.devSoldAtOpen) exit = true;
     if (!exit) continue;
     pushSell(mint, pos.tokens);
     if (c !== undefined) c.done = true;
@@ -398,9 +443,44 @@ function decideOrders(batch: any): any[] {
   for (const [mint, h] of held) {
     exposure += Math.max(0, lamportsToSol(positions.get(mint)?.cost ?? 0n));
   }
-  for (const [mint, c] of coins) {
+  // Only coins that traded in this batch are evaluated, like the tape they print.
+  for (const mint of traded) {
+    const c = coins.get(mint);
+    if (c === undefined) continue;
     if (orders.length >= cap) break;
     if (c.done) continue;
+    const curve = curves.get(mint);
+    if (curve === undefined || curve.complete) continue;
+    if (probes.has(mint) || hasPendingBuy(mint)) continue;
+
+    // --- add-on tranche into a held position that keeps holding up ---------
+    if (held.has(mint) && positions.has(mint)) {
+      if (c.devSold) continue;
+      if (c.buysSent > P.maxAdds) continue;
+      if (now - c.lastBuySlot < P.addDelaySlots) continue;
+      // Price at or above the last buy's decision price.
+      if (curve.vq * c.lastBuyVt < c.lastBuyVq * curve.vt) continue;
+      if (flowNet(c, now) < solToLamports(P.addMinFlowSol)) continue;
+      const addAmount = (() => {
+        const want = solToLamports(P.addSol);
+        const capAmt = maxBuyLamports(mint);
+        return want < capAmt ? want : capAmt;
+      })();
+      if (addAmount < solToLamports(P.minBuySol)) continue;
+      if (addAmount > solToLamports(P.maxExposureSol - exposure)) continue;
+      if (free < addAmount + tx) continue;
+      pushBuy(mint, addAmount);
+      free -= addAmount + tx;
+      exposure += lamportsToSol(addAmount);
+      c.buysSent += 1;
+      c.spentSent += addAmount;
+      c.lastBuyVq = curve.vq;
+      c.lastBuyVt = curve.vt;
+      c.lastBuySlot = now;
+      continue;
+    }
+
+    // --- first buy: young launches that pass the rug filter ----------------
     const age = now - c.createdSlot;
     if (age > P.maxAgeSlots) {
       c.done = true;
@@ -408,10 +488,8 @@ function decideOrders(batch: any): any[] {
     }
     if (age < P.minAgeSlots) continue;
     if (slotsLeft <= 0) break;
-    if (held.has(mint) || probes.has(mint) || hasPendingBuy(mint)) continue;
+    if (held.has(mint)) continue;
     if (positions.has(mint)) continue;
-    const curve = curves.get(mint);
-    if (curve === undefined || curve.complete) continue;
     // Rug filter.
     if (c.devSold) {
       c.done = true;
@@ -436,12 +514,19 @@ function decideOrders(batch: any): any[] {
     free -= amount + tx;
     exposure += lamportsToSol(amount);
     slotsLeft--;
+    c.buysSent = 1;
+    c.spentSent = amount;
+    c.lastBuyVq = curve.vq;
+    c.lastBuyVt = curve.vt;
+    c.lastBuySlot = now;
     held.set(mint, {
       openedSlot: now,
       peakValue: 0n,
       tookTp1: false,
       exiting: false,
       filled: false,
+      txPaid: 0n,
+      devSoldAtOpen: false,
     });
   }
 
